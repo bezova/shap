@@ -1,4 +1,5 @@
 import numpy as np
+import warnings
 try:
     import matplotlib.pyplot as pl
     import matplotlib
@@ -6,33 +7,61 @@ except ImportError:
     pass
 from . import labels
 from . import colors
+from ..common import convert_name, approximate_interactions
 
 # TODO: remove color argument / use color argument
 def dependence_plot(ind, shap_values, features, feature_names=None, display_features=None,
                     interaction_index="auto", color="#1E88E5", axis_color="#333333",
-                    dot_size=16, alpha=1, title=None, show=True):
-    """
-    Create a SHAP dependence plot, colored by an interaction feature.
+                    dot_size=16, x_jitter=0, alpha=1, title=None, xmin=None, xmax=None, show=True):
+    """ Create a SHAP dependence plot, colored by an interaction feature.
+
+    Plots the value of the feature on the x-axis and the SHAP value of the same feature
+    on the y-axis. This shows how the model depends on the given feature, and is like a
+    richer extenstion of the classical parital dependence plots. Vertical dispersion of the
+    data points represents interaction effects. Grey ticks along the y-axis are data
+    points where the feature's value was NaN.
+
 
     Parameters
     ----------
-    ind : int
-        Index of the feature to plot.
+    ind : int or string
+        If this is an int it is the index of the feature to plot. If this is a string it is
+        either the name of the feature to plot, or it can have the form "rank(int)" to specify
+        the feature with that rank (ordered by mean absolute SHAP value over all the samples).
 
     shap_values : numpy.array
-        Matrix of SHAP values (# samples x # features)
+        Matrix of SHAP values (# samples x # features).
 
     features : numpy.array or pandas.DataFrame
-        Matrix of feature values (# samples x # features)
+        Matrix of feature values (# samples x # features).
 
     feature_names : list
-        Names of the features (length # features)
+        Names of the features (length # features).
 
     display_features : numpy.array or pandas.DataFrame
-        Matrix of feature values for visual display (such as strings instead of coded values)
+        Matrix of feature values for visual display (such as strings instead of coded values).
 
-    interaction_index : "auto", None, or int
-        The index of the feature used to color the plot.
+    interaction_index : "auto", None, int, or string
+        The index of the feature used to color the plot. The name of a feature can also be passed
+        as a string. If "auto" then shap.common.approximate_interactions is used to pick what
+        seems to be the strongest interaction (note that to find to true stongest interaction you
+        need to compute the SHAP interaction values).
+        
+    x_jitter : float (0 - 1)
+        Adds random jitter to feature values. May increase plot readability when feature
+        is discrete.
+
+    alpha : float
+        The transparency of the data points (between 0 and 1). This can be useful to the
+        show density of the data points when using a large dataset.
+
+    xmin : float or string
+        Represents the lower bound of the plot's x-axis. It can be a string of the format
+        "percentile(float)" to denote that percentile of the feature's value used on the x-axis.
+
+    xmax : float or string
+        Represents the upper bound of the plot's x-axis. It can be a string of the format
+        "percentile(float)" to denote that percentile of the feature's value used on the x-axis.
     """
 
     # convert from DataFrames if we got any
@@ -56,23 +85,12 @@ def dependence_plot(ind, shap_values, features, feature_names=None, display_feat
     if len(features.shape) == 1:
         features = np.reshape(features, len(features), 1)
 
-    def convert_name(ind):
-        if type(ind) == str:
-            nzinds = np.where(feature_names == ind)[0]
-            if len(nzinds) == 0:
-                print("Could not find feature named: " + ind)
-                return None
-            else:
-                return nzinds[0]
-        else:
-            return ind
-
-    ind = convert_name(ind)
-
+    ind = convert_name(ind, shap_values, feature_names)
+    
     # plotting SHAP interaction values
     if len(shap_values.shape) == 3 and len(ind) == 2:
-        ind1 = convert_name(ind[0])
-        ind2 = convert_name(ind[1])
+        ind1 = convert_name(ind[0], shap_values, feature_names)
+        ind2 = convert_name(ind[1], shap_values, feature_names)
         if ind1 == ind2:
             proj_shap_values = shap_values[:, ind2, :]
         else:
@@ -98,9 +116,11 @@ def dependence_plot(ind, shap_values, features, feature_names=None, display_feat
         "'shap_values' must have the same number of columns as 'features'!"
 
     # get both the raw and display feature values
-    xv = features[:, ind]
-    xd = display_features[:, ind]
-    s = shap_values[:, ind]
+    oinds = np.arange(shap_values.shape[0]) # we randomize the ordering so plotting overlaps are not related to data ordering
+    np.random.shuffle(oinds)
+    xv = features[oinds, ind].astype(np.float64)
+    xd = display_features[oinds, ind]
+    s = shap_values[oinds, ind]
     if type(xd[0]) == str:
         name_map = {}
         for i in range(len(xv)):
@@ -114,8 +134,8 @@ def dependence_plot(ind, shap_values, features, feature_names=None, display_feat
 
     # guess what other feature as the stongest interaction with the plotted feature
     if interaction_index == "auto":
-        interaction_index = approx_interactions(ind, shap_values, features)[0]
-    interaction_index = convert_name(interaction_index)
+        interaction_index = approximate_interactions(ind, shap_values, features)[0]
+    interaction_index = convert_name(interaction_index, shap_values, feature_names)
     categorical_interaction = False
 
     # get both the raw and display color values
@@ -136,17 +156,43 @@ def dependence_plot(ind, shap_values, features, feature_names=None, display_feat
     # discritize colors for categorical features
     color_norm = None
     if categorical_interaction and clow != chigh:
-        bounds = np.linspace(clow, chigh, chigh - clow + 2)
+        bounds = np.linspace(clow, chigh, int(chigh - clow + 2))
         color_norm = matplotlib.colors.BoundaryNorm(bounds, colors.red_blue.N)
+        
+    # optionally add jitter to feature values
+    if x_jitter > 0:
+        if x_jitter > 1: x_jitter = 1
+        xvals = xv.copy()
+        if isinstance(xvals[0], float):
+            xvals = xvals.astype(np.float)
+            xvals = xvals[~np.isnan(xvals)]
+        xvals = np.unique(xvals)
+        if len(xvals) >= 2:
+            smallest_diff = np.min(np.diff(np.sort(xvals)))
+            jitter_amount = x_jitter * smallest_diff
+            xv += (np.random.ranf(size = len(xv))*jitter_amount) - (jitter_amount/2)
 
     # the actual scatter plot, TODO: adapt the dot_size to the number of data points?
     if interaction_index is not None:
-        pl.scatter(xv, s, s=dot_size, linewidth=0, c=features[:, interaction_index], cmap=colors.red_blue,
-                   alpha=alpha, vmin=clow, vmax=chigh, norm=color_norm, rasterized=len(xv) > 500)
+
+        # plot the nan values in the interaction feature as grey
+        cvals = features[oinds, interaction_index].astype(np.float64)
+        cvals_imp = cvals.copy()
+        cvals_imp[np.isnan(cvals)] = (clow + chigh) / 2.0
+        cvals[cvals_imp > chigh] = chigh
+        cvals[cvals_imp < clow] = clow
+        xv_nan = np.isnan(xv)
+        xv_notnan = np.invert(xv_nan)
+        p = pl.scatter(
+            xv[xv_notnan], s[xv_notnan], s=dot_size, linewidth=0, c=cvals_imp[xv_notnan],
+            cmap=colors.red_blue_solid, alpha=alpha, vmin=clow, vmax=chigh,
+            norm=color_norm, rasterized=len(xv) > 500
+        )
+        p.set_array(cvals[xv_notnan])
     else:
         pl.scatter(xv, s, s=dot_size, linewidth=0, color="#1E88E5",
                    alpha=alpha, rasterized=len(xv) > 500)
-
+    
     if interaction_index != ind and interaction_index is not None:
         # draw the color bar
         if type(cd[0]) == str:
@@ -168,6 +214,37 @@ def dependence_plot(ind, shap_values, features, feature_names=None, display_feat
         bbox = cb.ax.get_window_extent().transformed(pl.gcf().dpi_scale_trans.inverted())
         cb.ax.set_aspect((bbox.height - 0.7) * 20)
 
+    # handles any setting of xmax and xmin
+    # note that we handle None,float, or "percentile(float)" formats
+    if xmin is not None or xmax is not None:
+        if type(xmin) == str and xmin.startswith("percentile"):
+            xmin = np.nanpercentile(xv, float(xmin[11:-1]))
+        if type(xmax) == str and xmax.startswith("percentile"):
+            xmax = np.nanpercentile(xv, float(xmax[11:-1]))
+
+        if xmin is None or xmin == np.nanmin(xv):
+            xmin = np.nanmin(xv) - (xmax - np.nanmin(xv))/20
+        if xmax is None or xmax == np.nanmax(xv):
+            xmax = np.nanmax(xv) + (np.nanmax(xv) - xmin)/20
+        
+        pl.xlim(xmin, xmax)
+
+    # plot any nan feature values as tick marks along the y-axis
+    xlim = pl.xlim()
+    if interaction_index is not None:
+        p = pl.scatter(
+            xlim[0] * np.ones(xv_nan.sum()), s[xv_nan], marker=1,
+            linewidth=2, c=cvals_imp[xv_nan], cmap=colors.red_blue_solid, alpha=alpha,
+            vmin=clow, vmax=chigh
+        )
+        p.set_array(cvals[xv_nan])
+    else:
+        pl.scatter(
+            xlim[0] * np.ones(xv_nan.sum()), s[xv_nan], marker=1,
+            linewidth=2, color="#1E88E5", alpha=alpha
+        )
+    pl.xlim(*xlim)
+
     # make the plot more readable
     if interaction_index != ind:
         pl.gcf().set_size_inches(7.5, 5)
@@ -187,36 +264,6 @@ def dependence_plot(ind, shap_values, features, feature_names=None, display_feat
     if type(xd[0]) == str:
         pl.xticks([name_map[n] for n in xnames], xnames, rotation='vertical', fontsize=11)
     if show:
-        pl.show()
-
-
-def approx_interactions(index, shap_values, X):
-    """ Order other features by how much interaction they seem to have with the feature at the given index.
-
-    This just bins the SHAP values for a feature along that feature's value. For true Shapley interaction
-    index values for SHAP see the interaction_contribs option implemented in XGBoost.
-    """
-
-    if X.shape[0] > 10000:
-        a = np.arange(X.shape[0])
-        np.random.shuffle(a)
-        inds = a[:10000]
-    else:
-        inds = np.arange(X.shape[0])
-
-    x = X[inds, index]
-    srt = np.argsort(x)
-    shap_ref = shap_values[inds, index]
-    shap_ref = shap_ref[srt]
-    inc = max(min(int(len(x) / 10.0), 50), 1)
-    interactions = []
-    for i in range(X.shape[1]):
-        val_other = X[inds, i][srt].astype(np.float)
-        v = 0.0
-        if not (i == index or np.sum(np.abs(val_other)) < 1e-8):
-            for j in range(0, len(x), inc):
-                if np.std(val_other[j:j + inc]) > 0 and np.std(shap_ref[j:j + inc]) > 0:
-                    v += abs(np.corrcoef(shap_ref[j:j + inc], val_other[j:j + inc])[0, 1])
-        interactions.append(v)
-
-    return np.argsort(-np.abs(interactions))
+        with warnings.catch_warnings(): # ignore expected matplotlib warnings
+            warnings.simplefilter("ignore", RuntimeWarning)
+            pl.show()
